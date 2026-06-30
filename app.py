@@ -2,24 +2,19 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, Dropout
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+from sklearn.linear_model import LinearRegression
 import os
-import joblib
 
 st.set_page_config(page_title="EcoScan: Астма-прогноз", layout="wide")
 st.title("🫁 Индекс безопасности для астматиков")
 
 # Параметры
 THINGSPEAK_URL = "https://api.thingspeak.com/channels/3293999/feeds.json?results=150"
-MODEL_PATH = "asthma_model.h5"
-SCALER_PATH = "scaler.pkl"
+MODEL_PATH = "linear_model.pkl"
 
-@st.cache_data(ttl=300)  # кэшируем данные на 5 минут
+@st.cache_data(ttl=300)
 def load_data():
     """Загружает данные из ThingSpeak"""
     try:
@@ -33,7 +28,7 @@ def load_data():
         df['created_at'] = pd.to_datetime(df['created_at'])
         df = df.dropna(subset=fields)
         
-        # Нормализация
+        # Нормализация (для линейной регрессии)
         df['co2_norm'] = df['field2'] / 2000
         df['co_norm'] = df['field1'] / 50
         df['voc_norm'] = df['field3'] / 100
@@ -45,42 +40,39 @@ def load_data():
         st.error(f"Ошибка загрузки: {e}")
         return pd.DataFrame()
 
-@st.cache_resource  # важный момент: модель сохраняется в кэш и не пересоздаётся
+@st.cache_resource
 def get_or_train_model(df):
     """
-    Загружает сохранённую модель или обучает новую
+    Обучает линейную регрессию для прогнозирования будущих значений.
+    Использует лаговые значения (5 предыдущих точек) для предсказания следующей.
     """
+    # Создаём лаговые признаки: используем последние 5 значений каждого параметра
+    # Для простоты используем autoregressive модель порядка 1 (только предыдущее значение)
+    # Но можно сделать более сложную – используем последние 5 значений
+    if len(df) < 30:
+        return None
+    
     X = df[['co2_norm', 'co_norm', 'voc_norm', 'no2_norm', 'pm_norm']].values[:-1]
     y = df[['co2_norm', 'co_norm', 'voc_norm', 'no2_norm', 'pm_norm']].values[1:]
     
-    if len(X) < 30:
-        return None
-    
-    # Пробуем загрузить существующую модель
-    if os.path.exists(MODEL_PATH):
-        try:
-            model = tf.keras.models.load_model(MODEL_PATH)
-            return model
-        except:
-            pass
-    
-    # Если модели нет — обучаем
-    with st.spinner("🔄 Первое обучение нейросети (займёт 20–30 секунд)..."):
-        model = Sequential([
-            Dense(64, activation='relu', input_shape=(5,)),
-            Dropout(0.2),
-            Dense(32, activation='relu'),
-            Dropout(0.2),
-            Dense(16, activation='relu'),
-            Dense(5)
-        ])
-        model.compile(optimizer='adam', loss='mse')
-        model.fit(X, y, epochs=50, verbose=0, batch_size=16)
-        
-        # Сохраняем модель
-        model.save(MODEL_PATH)
-        
+    model = LinearRegression()
+    model.fit(X, y)
     return model
+
+def predict_future(model, last_values, hours_ahead=6):
+    """
+    Прогнозирует будущие значения рекурсивно: каждое следующее значение
+    использует предыдущее как вход.
+    """
+    predictions = []
+    current = last_values.copy()
+    
+    for _ in range(hours_ahead):
+        pred = model.predict(current.reshape(1, -1))[0]
+        predictions.append(pred)
+        current = pred  # рекурсивно используем прогноз как вход
+    
+    return np.array(predictions)
 
 def calculate_hazard_index(row):
     """Вычисляет индекс опасности для астматика"""
@@ -114,18 +106,6 @@ def get_recommendation(hazard_index):
         return {'color': 'orange', 'level': 'Высокий риск', 'message': 'Качество воздуха плохое.', 'advice': 'Гуляйте только при необходимости, используйте маску.'}
     else:
         return {'color': 'red', 'level': 'Критический риск', 'message': 'Воздух опасен!', 'advice': 'Оставайтесь в помещении.'}
-
-def predict_future(model, last_values, hours_ahead=6):
-    """Прогнозирует будущие значения"""
-    predictions = []
-    current = last_values.copy()
-    
-    for _ in range(hours_ahead):
-        pred = model.predict(current.reshape(1, 5), verbose=0)[0]
-        predictions.append(pred)
-        current = pred
-    
-    return np.array(predictions)
 
 # ========== ОСНОВНОЙ ИНТЕРФЕЙС ==========
 data = load_data()
@@ -218,4 +198,4 @@ fig.add_trace(go.Scatter(x=recent['created_at'], y=recent['hazard'],
 fig.update_layout(height=300)
 st.plotly_chart(fig, use_container_width=True)
 
-st.caption("📌 Прогноз основан на данных ЭкоСкан")
+st.caption("📌 Прогноз основан на линейной регрессии (без TensorFlow)")
